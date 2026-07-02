@@ -1,0 +1,15 @@
+{
+  "name": "apollo-reliability-tracker",
+  "version": "1.0.0",
+  "description": "Slack bot that reacts to parent messages when @apollo-reliability is mentioned in a thread",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "@slack/bolt": "^3.19.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
