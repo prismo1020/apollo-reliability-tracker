@@ -33,8 +33,10 @@ async function getUserName(client, userId) {
 
 async function getGroupMembers(client) {
   try {
-    const res = await client.usergroups.users.list({ usergroup: APOLLO_SUBTEAM_ID });
-    return res.users || [];
+    // usergroups.list with include_users returns members without needing usergroups:users:read
+    const res = await client.usergroups.list({ include_users: true });
+    const group = (res.usergroups || []).find(g => g.id === APOLLO_SUBTEAM_ID);
+    return group?.users || [];
   } catch {
     return [];
   }
