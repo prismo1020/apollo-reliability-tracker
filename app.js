@@ -320,12 +320,6 @@ app.message(async ({ message, client, logger }) => {
       const mentionedBy = await getUserName(client, message.user);
       const messages = await getThreadData(client, message.channel, threadTs);
 
-      // React with a logged emoji so users know it was captured
-      await client.reactions.add({
-        channel: message.channel,
-        timestamp: message.ts,
-        name: 'eyes',
-      }).catch(err => { if (err.data?.error !== 'already_reacted') throw err; });
 
       await appendToSheet('Apollo Mentions', [
         timestamp, channelName, location, mentionedBy, threadLink, messages.length - 1
