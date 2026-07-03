@@ -275,25 +275,8 @@ app.message(async ({ message, client, logger }) => {
     }
   }
 
-  // --- Apollo bot reply ---
-  if (isApolloReply && isReply) {
-    try {
-      const channelName = await getChannelName(client, message.channel);
-      const threadLink = `https://slack.com/archives/${message.channel}/p${threadTs.replace('.', '')}`;
-      const timestamp = new Date().toISOString();
-      const threadId = threadKey;
-
-      await appendToSheet('Apollo Conversations', [
-        threadId, timestamp, channelName, 'Apollo', 'Bot', message.text, threadLink
-      ]);
-      await db.query(
-        'INSERT INTO apollo_conversations (thread_id, channel_name, thread_link, speaker, role, message) VALUES ($1, $2, $3, $4, $5, $6)',
-        [threadId, channelName, threadLink, 'Apollo', 'Bot', message.text]
-      );
-    } catch (err) {
-      logger.error('Error handling Apollo reply:', err);
-    }
-  }
+  // Apollo's initial "..." placeholder — skip it, we'll capture the edited version instead
+  if (isApolloReply && isReply) return;
 
   // --- Clear reliability timer if group member replies ---
   if (!isReliabilityMention && pendingThreads.has(threadKey)) {
@@ -302,6 +285,35 @@ app.message(async ({ message, client, logger }) => {
       clearTimeout(pendingThreads.get(threadKey));
       pendingThreads.delete(threadKey);
     }
+  }
+});
+
+// --- Capture Apollo's real response when it edits its "..." placeholder ---
+app.event('message', async ({ event, client, logger }) => {
+  if (event.subtype !== 'message_changed') return;
+
+  const msg = event.message;
+  const isApolloReply = msg.user === APOLLO_BOT_USER_ID || (msg.bot_id && msg.username?.toLowerCase().includes('apollo'));
+  if (!isApolloReply) return;
+  if (!msg.thread_ts || msg.thread_ts === msg.ts) return;
+  if (!msg.text || msg.text.trim() === '...') return;
+
+  try {
+    const threadTs = msg.thread_ts;
+    const threadKey = `${event.channel}-${threadTs}`;
+    const channelName = await getChannelName(client, event.channel);
+    const threadLink = `https://slack.com/archives/${event.channel}/p${threadTs.replace('.', '')}`;
+    const timestamp = new Date().toISOString();
+
+    await appendToSheet('Apollo Conversations', [
+      threadKey, timestamp, channelName, 'Apollo', 'Bot', msg.text, threadLink
+    ]);
+    await db.query(
+      'INSERT INTO apollo_conversations (thread_id, channel_name, thread_link, speaker, role, message) VALUES ($1, $2, $3, $4, $5, $6)',
+      [threadKey, channelName, threadLink, 'Apollo', 'Bot', msg.text]
+    );
+  } catch (err) {
+    logger.error('Error capturing Apollo edited reply:', err);
   }
 });
 
