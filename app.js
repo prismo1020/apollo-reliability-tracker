@@ -129,27 +129,27 @@ async function getChannelName(client, channel) {
 
 // --- Message handler ---
 app.message(async ({ message, client, logger }) => {
-  if (!message.thread_ts || !message.text) return;
+  if (!message.text) return;
 
-  const isReply = message.thread_ts !== message.ts;
-  if (!isReply) return;
+  const isReply = !!(message.thread_ts && message.thread_ts !== message.ts);
+  const threadTs = message.thread_ts || message.ts; // for parent messages, use ts as thread anchor
 
   const isReliabilityMention = message.text.includes(`<!subteam^${APOLLO_RELIABILITY_SUBTEAM_ID}`);
   const isApolloMention = message.text.includes(`<@${APOLLO_BOT_USER_ID}>`);
-  const threadKey = `${message.channel}-${message.thread_ts}`;
+  const threadKey = `${message.channel}-${threadTs}`;
 
   // --- @apollo-reliability mention ---
   if (isReliabilityMention) {
     try {
       await client.reactions.add({
         channel: message.channel,
-        timestamp: message.thread_ts,
+        timestamp: threadTs,
         name: REACT_EMOJI,
       }).catch(err => { if (err.data?.error !== 'already_reacted') throw err; });
 
-      const messages = await getThreadData(client, message.channel, message.thread_ts);
+      const messages = await getThreadData(client, message.channel, threadTs);
       const channelName = await getChannelName(client, message.channel);
-      const threadLink = `https://slack.com/archives/${message.channel}/p${message.thread_ts.replace('.', '')}`;
+      const threadLink = `https://slack.com/archives/${message.channel}/p${threadTs.replace('.', '')}`;
       const mentionedBy = await getUserName(client, message.user);
       const replyCount = messages.length - 1;
 
@@ -190,7 +190,7 @@ app.message(async ({ message, client, logger }) => {
         const startTime = Date.now();
         const timer = setTimeout(async () => {
           try {
-            const refreshed = await getThreadData(client, message.channel, message.thread_ts);
+            const refreshed = await getThreadData(client, message.channel, threadTs);
             const groupMembers = await getGroupMembers(client);
             const replyMessages = refreshed.slice(1);
             const groupReply = replyMessages.find(m => groupMembers.includes(m.user));
@@ -240,9 +240,9 @@ app.message(async ({ message, client, logger }) => {
   // --- @apollo mention ---
   if (isApolloMention) {
     try {
-      const messages = await getThreadData(client, message.channel, message.thread_ts);
+      const messages = await getThreadData(client, message.channel, threadTs);
       const channelName = await getChannelName(client, message.channel);
-      const threadLink = `https://slack.com/archives/${message.channel}/p${message.thread_ts.replace('.', '')}`;
+      const threadLink = `https://slack.com/archives/${message.channel}/p${threadTs.replace('.', '')}`;
       const mentionedBy = await getUserName(client, message.user);
       const replyCount = messages.length - 1;
       const timestamp = new Date().toISOString();
@@ -300,4 +300,5 @@ cron.schedule('0 9 * * 1', async () => {
   const port = process.env.PORT || 3000;
   await app.start(port);
   console.log(`Apollo Reliability Tracker running on port ${port}`);
+
 })();
