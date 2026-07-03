@@ -20,6 +20,7 @@ const RESPONSE_WINDOW_MS = 4 * 60 * 60 * 1000;
 const SHEET_ID = process.env.GOOGLE_SHEET_ID;
 
 const pendingThreads = new Map();
+const apolloEditDebounce = new Map(); // debounce Apollo streaming edits
 const userCache = {};
 
 // --- Google Sheets ---
@@ -288,7 +289,7 @@ app.message(async ({ message, client, logger }) => {
   }
 });
 
-// --- Capture Apollo's real response when it edits its "..." placeholder ---
+// --- Capture Apollo's final response (debounced to avoid logging every streaming edit) ---
 app.event('message', async ({ event, client, logger }) => {
   if (event.subtype !== 'message_changed') return;
 
@@ -298,23 +299,35 @@ app.event('message', async ({ event, client, logger }) => {
   if (!msg.thread_ts || msg.thread_ts === msg.ts) return;
   if (!msg.text || msg.text.trim() === '...') return;
 
-  try {
-    const threadTs = msg.thread_ts;
-    const threadKey = `${event.channel}-${threadTs}`;
-    const channelName = await getChannelName(client, event.channel);
-    const threadLink = `https://slack.com/archives/${event.channel}/p${threadTs.replace('.', '')}`;
-    const timestamp = new Date().toISOString();
+  // Key by the individual message ts so each Apollo reply has its own debounce timer
+  const debounceKey = `${event.channel}-${msg.ts}`;
 
-    await appendToSheet('Apollo Conversations', [
-      threadKey, timestamp, channelName, 'Apollo', 'Bot', msg.text, threadLink
-    ]);
-    await db.query(
-      'INSERT INTO apollo_conversations (thread_id, channel_name, thread_link, speaker, role, message) VALUES ($1, $2, $3, $4, $5, $6)',
-      [threadKey, channelName, threadLink, 'Apollo', 'Bot', msg.text]
-    );
-  } catch (err) {
-    logger.error('Error capturing Apollo edited reply:', err);
+  // Cancel any existing timer for this message
+  if (apolloEditDebounce.has(debounceKey)) {
+    clearTimeout(apolloEditDebounce.get(debounceKey));
   }
+
+  // Set a new timer — only fires if no more edits come in for 5 seconds
+  apolloEditDebounce.set(debounceKey, setTimeout(async () => {
+    apolloEditDebounce.delete(debounceKey);
+    try {
+      const threadTs = msg.thread_ts;
+      const threadKey = `${event.channel}-${threadTs}`;
+      const channelName = await getChannelName(client, event.channel);
+      const threadLink = `https://slack.com/archives/${event.channel}/p${threadTs.replace('.', '')}`;
+      const timestamp = new Date().toISOString();
+
+      await appendToSheet('Apollo Conversations', [
+        threadKey, timestamp, channelName, 'Apollo', 'Bot', msg.text, threadLink
+      ]);
+      await db.query(
+        'INSERT INTO apollo_conversations (thread_id, channel_name, thread_link, speaker, role, message) VALUES ($1, $2, $3, $4, $5, $6)',
+        [threadKey, channelName, threadLink, 'Apollo', 'Bot', msg.text]
+      );
+    } catch (err) {
+      logger.error('Error capturing Apollo final reply:', err);
+    }
+  }, 5000)); // wait 5 seconds after last edit
 });
 
 // Weekly digest — every Monday at 9:00 AM UTC
