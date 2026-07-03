@@ -22,7 +22,7 @@ const SHEET_ID = process.env.GOOGLE_SHEET_ID;
 const pendingThreads = new Map();
 const userCache = {};
 
-// --- Google Sheets setup ---
+// --- Google Sheets ---
 function getSheetsClient() {
   const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
   const auth = new google.auth.GoogleAuth({
@@ -38,23 +38,26 @@ async function ensureSheetTabs() {
   const existingTitles = res.data.sheets.map(s => s.properties.title);
 
   const requests = [];
-
   if (!existingTitles.includes('Apollo Reliability Mentions')) {
     requests.push({ addSheet: { properties: { title: 'Apollo Reliability Mentions' } } });
   }
   if (!existingTitles.includes('Apollo Mentions')) {
     requests.push({ addSheet: { properties: { title: 'Apollo Mentions' } } });
   }
-
+  if (!existingTitles.includes('Apollo Conversations')) {
+    requests.push({ addSheet: { properties: { title: 'Apollo Conversations' } } });
+  }
   if (requests.length > 0) {
     await sheets.spreadsheets.batchUpdate({ spreadsheetId: SHEET_ID, requestBody: { requests } });
   }
 
-  // Add headers if sheets are new
-  const reliabilityHeaders = [['Timestamp', 'Channel', 'Mentioned By', 'Thread Link', 'Thread Contents', '# of Replies', 'Response Time (mins)', 'Got Response?']];
-  const apolloHeaders = [['Timestamp', 'Channel', 'Mentioned By', 'Thread Link', '# of Replies']];
+  const tabHeaders = [
+    ['Apollo Reliability Mentions', [['Timestamp', 'Channel', 'Mentioned By', 'Thread Link', 'Thread Contents', '# of Replies', 'Response Time (mins)', 'Got Response?']]],
+    ['Apollo Mentions', [['Timestamp', 'Channel', 'Mentioned By', 'Thread Link', '# of Replies']]],
+    ['Apollo Conversations', [['Thread ID', 'Timestamp', 'Channel', 'Speaker', 'Role', 'Message', 'Thread Link']]],
+  ];
 
-  for (const [tab, headers] of [['Apollo Reliability Mentions', reliabilityHeaders], ['Apollo Mentions', apolloHeaders]]) {
+  for (const [tab, headers] of tabHeaders) {
     const check = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${tab}!A1` });
     if (!check.data.values) {
       await sheets.spreadsheets.values.update({
@@ -67,17 +70,18 @@ async function ensureSheetTabs() {
   }
 }
 
-async function appendToSheet(tab, row) {
+async function appendToSheet(tab, rows) {
   const sheets = getSheetsClient();
+  const values = Array.isArray(rows[0]) ? rows : [rows];
   await sheets.spreadsheets.values.append({
     spreadsheetId: SHEET_ID,
     range: `${tab}!A1`,
     valueInputOption: 'USER_ENTERED',
-    requestBody: { values: [row] },
+    requestBody: { values },
   });
 }
 
-// --- DB setup ---
+// --- DB ---
 async function setupDb() {
   await db.query(`
     CREATE TABLE IF NOT EXISTS mentions (
@@ -86,7 +90,17 @@ async function setupDb() {
       link TEXT,
       mentioned_by TEXT,
       created_at TIMESTAMPTZ DEFAULT NOW()
-    )
+    );
+    CREATE TABLE IF NOT EXISTS apollo_conversations (
+      id SERIAL PRIMARY KEY,
+      thread_id TEXT,
+      channel_name TEXT,
+      thread_link TEXT,
+      speaker TEXT,
+      role TEXT,
+      message TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
 }
 
@@ -132,11 +146,12 @@ app.message(async ({ message, client, logger }) => {
   if (!message.text) return;
 
   const isReply = !!(message.thread_ts && message.thread_ts !== message.ts);
-  const threadTs = message.thread_ts || message.ts; // for parent messages, use ts as thread anchor
+  const threadTs = message.thread_ts || message.ts;
+  const threadKey = `${message.channel}-${threadTs}`;
 
   const isReliabilityMention = message.text.includes(`<!subteam^${APOLLO_RELIABILITY_SUBTEAM_ID}`);
   const isApolloMention = message.text.includes(`<@${APOLLO_BOT_USER_ID}>`);
-  const threadKey = `${message.channel}-${threadTs}`;
+  const isApolloReply = message.user === APOLLO_BOT_USER_ID || message.bot_id != null && message.username?.toLowerCase().includes('apollo');
 
   // --- @apollo-reliability mention ---
   if (isReliabilityMention) {
@@ -162,30 +177,25 @@ app.message(async ({ message, client, logger }) => {
       const threadContents = lines.join('\n');
       const timestamp = new Date().toISOString();
 
-      // Post thread recap to feedback channel
       await client.chat.postMessage({
         channel: FEEDBACK_CHANNEL,
         text: `*@apollo-reliability was mentioned in ${channelName}* (<${threadLink}|View thread>)\n\n${threadContents}`,
       });
 
-      // DM Danielle and Kenneth
       const dmText = `*@apollo-reliability was mentioned in ${channelName}* by ${mentionedBy}\n<${threadLink}|View thread>`;
       for (const userId of DM_USERS) {
         await client.chat.postMessage({ channel: userId, text: dmText });
       }
 
-      // Log to Google Sheet (response time and got response filled in later)
       await appendToSheet('Apollo Reliability Mentions', [
         timestamp, channelName, mentionedBy, threadLink, threadContents, replyCount, '', 'Pending'
       ]);
 
-      // Store for weekly digest
       await db.query(
         'INSERT INTO mentions (channel_name, link, mentioned_by) VALUES ($1, $2, $3)',
         [channelName, threadLink, mentionedBy]
       );
 
-      // Start 4-hour response timer
       if (!pendingThreads.has(threadKey)) {
         const startTime = Date.now();
         const timer = setTimeout(async () => {
@@ -206,7 +216,6 @@ app.message(async ({ message, client, logger }) => {
               });
             }
 
-            // Update sheet row — find and update the matching row
             const sheets = getSheetsClient();
             const sheetData = await sheets.spreadsheets.values.get({
               spreadsheetId: SHEET_ID,
@@ -237,21 +246,52 @@ app.message(async ({ message, client, logger }) => {
     }
   }
 
-  // --- @apollo mention ---
+  // --- @apollo mention (user tagging Apollo) ---
   if (isApolloMention) {
     try {
-      const messages = await getThreadData(client, message.channel, threadTs);
       const channelName = await getChannelName(client, message.channel);
       const threadLink = `https://slack.com/archives/${message.channel}/p${threadTs.replace('.', '')}`;
       const mentionedBy = await getUserName(client, message.user);
-      const replyCount = messages.length - 1;
       const timestamp = new Date().toISOString();
 
+      // Log to Apollo Mentions tab
+      const messages = await getThreadData(client, message.channel, threadTs);
       await appendToSheet('Apollo Mentions', [
-        timestamp, channelName, mentionedBy, threadLink, replyCount
+        timestamp, channelName, mentionedBy, threadLink, messages.length - 1
       ]);
+
+      // Log this user message to Apollo Conversations tab + DB
+      const threadId = threadKey;
+      await appendToSheet('Apollo Conversations', [
+        threadId, timestamp, channelName, mentionedBy, 'User', message.text, threadLink
+      ]);
+      await db.query(
+        'INSERT INTO apollo_conversations (thread_id, channel_name, thread_link, speaker, role, message) VALUES ($1, $2, $3, $4, $5, $6)',
+        [threadId, channelName, threadLink, mentionedBy, 'User', message.text]
+      );
+
     } catch (err) {
       logger.error('Error handling @apollo mention:', err);
+    }
+  }
+
+  // --- Apollo bot reply ---
+  if (isApolloReply && isReply) {
+    try {
+      const channelName = await getChannelName(client, message.channel);
+      const threadLink = `https://slack.com/archives/${message.channel}/p${threadTs.replace('.', '')}`;
+      const timestamp = new Date().toISOString();
+      const threadId = threadKey;
+
+      await appendToSheet('Apollo Conversations', [
+        threadId, timestamp, channelName, 'Apollo', 'Bot', message.text, threadLink
+      ]);
+      await db.query(
+        'INSERT INTO apollo_conversations (thread_id, channel_name, thread_link, speaker, role, message) VALUES ($1, $2, $3, $4, $5, $6)',
+        [threadId, channelName, threadLink, 'Apollo', 'Bot', message.text]
+      );
+    } catch (err) {
+      logger.error('Error handling Apollo reply:', err);
     }
   }
 
@@ -300,5 +340,4 @@ cron.schedule('0 9 * * 1', async () => {
   const port = process.env.PORT || 3000;
   await app.start(port);
   console.log(`Apollo Reliability Tracker running on port ${port}`);
-
 })();
